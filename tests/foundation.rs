@@ -544,7 +544,7 @@ async fn dashboard_restores_scoped_tasks_and_report_links_without_secrets() {
             assert_eq!(value["capabilities"]["vendor_sending"], false);
             assert_eq!(value["capabilities"]["purchase_order_drafts"], true);
         } else if path == "/v1/agents" {
-            assert_eq!(value["agents"].as_array().unwrap().len(), 2);
+            assert_eq!(value["agents"].as_array().unwrap().len(), 3);
             assert_eq!(value["agents"][0]["id"], "sales");
         } else {
             assert_eq!(value["runs"][0]["input"]["message"], "Check inventory");
@@ -672,8 +672,9 @@ async fn scoped_agents_pause_catch_up_isolate_and_checkpoint_atomically() {
     use backhaus_ai_backend::scoped_agents as agents;
     let (pool, cfg) = setup().await;
     let w = &cfg.workspace_id;
+    agents::control(&pool, w, "sales", "resume").await.unwrap();
     let initial = agents::list(&pool, w).await.unwrap();
-    assert_eq!(initial["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(initial["agents"].as_array().unwrap().len(), 3);
     assert_eq!(initial["monitor_online"], false);
     let instance = Uuid::new_v4();
     agents::heartbeat(&pool, w, instance).await.unwrap();
@@ -1100,6 +1101,7 @@ async fn table_pages_are_scoped_bounded_and_complete() {
             &TableQuery {
                 page: Some(page),
                 status: None,
+                search: None,
             },
         )
         .await
@@ -1125,11 +1127,59 @@ async fn table_pages_are_scoped_bounded_and_complete() {
         &TableQuery {
             page: Some(10),
             status: None,
+            search: None,
         },
     )
     .await
     .unwrap();
     assert_eq!(last["page"], 3);
+    let below = tables::page(
+        &pool,
+        &cfg.workspace_id,
+        "inventory",
+        &TableQuery {
+            page: None,
+            status: Some("below_par".into()),
+            search: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(below["total"].as_i64().unwrap() > 0);
+    assert!(
+        below["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["status"] == "Below par")
+    );
+    let searched = tables::page(
+        &pool,
+        &cfg.workspace_id,
+        "inventory",
+        &TableQuery {
+            page: None,
+            status: None,
+            search: Some("%".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(searched["total"], 0);
+    assert!(
+        tables::page(
+            &pool,
+            &cfg.workspace_id,
+            "sales",
+            &TableQuery {
+                page: None,
+                status: None,
+                search: Some("rice".into()),
+            },
+        )
+        .await
+        .is_err()
+    );
     let sales = tables::page(&pool, &cfg.workspace_id, "sales", &TableQuery::default())
         .await
         .unwrap();
@@ -1244,6 +1294,7 @@ async fn menu_backfill_preserves_inventory_and_pages_prices() {
         &TableQuery {
             page: Some(3),
             status: None,
+            search: None,
         },
     )
     .await
@@ -1311,6 +1362,7 @@ async fn record_details_are_scoped_and_page_related_items() {
         &TableQuery {
             page: Some(2),
             status: None,
+            search: None,
         },
     )
     .await
@@ -1344,7 +1396,8 @@ async fn record_details_are_scoped_and_page_related_items() {
                 id,
                 &TableQuery {
                     page: Some(0),
-                    status: None
+                    status: None,
+                    search: None,
                 }
             )
             .await

@@ -46,14 +46,26 @@ pub async fn run(pool: PgPool, config: Arc<Config>, mode: &str) -> Result<()> {
         });
     }
     if mode != "serve" {
-        let db = pool.clone();
-        let cfg = config.clone();
-        let stopped = receiver.clone();
-        tasks.spawn(async move { chat_worker(db, cfg, stopped).await });
+        for lane in [crate::jobs::Lane::Chat, crate::jobs::Lane::Background] {
+            let db = pool.clone();
+            let cfg = config.clone();
+            let stopped = receiver.clone();
+            tasks.spawn(async move { agent_worker(db, cfg, stopped, lane).await });
+        }
         let db = pool.clone();
         let cfg = config.clone();
         let stopped = receiver.clone();
         tasks.spawn(async move { monitors(db, cfg, stopped).await });
+        let db = pool.clone();
+        let cfg = config.clone();
+        let stopped = receiver.clone();
+        tasks.spawn(async move {
+            while !*stopped.borrow() {
+                tokio::select! { _=wait_for_stop(stopped.clone())=>break, result=crate::outreach::process_replies(&db,&cfg.workspace_id,&cfg)=>if let Err(error)=result {tracing::debug!(%error,"Supplier inbox check pending");} }
+                tokio::select! {_=wait_for_stop(stopped.clone())=>break,_=tokio::time::sleep(Duration::from_secs(30))=>{}}
+            }
+            Ok(())
+        });
     }
     tracing::info!(mode, "Backend ready; press Ctrl+C to stop");
     let failure = tokio::select! {
@@ -85,7 +97,12 @@ pub async fn run(pool: PgPool, config: Arc<Config>, mode: &str) -> Result<()> {
     Ok(())
 }
 
-async fn chat_worker(pool: PgPool, config: Arc<Config>, stop: watch::Receiver<bool>) -> Result<()> {
+async fn agent_worker(
+    pool: PgPool,
+    config: Arc<Config>,
+    stop: watch::Receiver<bool>,
+    lane: crate::jobs::Lane,
+) -> Result<()> {
     if config.model_name.is_none() || config.model_base_url.is_none() {
         tracing::info!(
             "Chat worker waiting for model configuration; data monitors remain available"
@@ -97,7 +114,7 @@ async fn chat_worker(pool: PgPool, config: Arc<Config>, stop: watch::Receiver<bo
     while !*stop.borrow() {
         let mut worker = match Worker::spawn(&config).await {
             Ok(worker) => {
-                tracing::info!(sdk=%worker.sdk_version, "Strands worker ready");
+                tracing::info!(?lane, sdk=%worker.sdk_version, "Strands worker ready");
                 backoff = Duration::from_secs(1);
                 worker
             }
@@ -112,7 +129,9 @@ async fn chat_worker(pool: PgPool, config: Arc<Config>, stop: watch::Receiver<bo
             }
         };
         while !*stop.borrow() {
-            match agent::work_one_until(&pool, config.clone(), stop.clone(), &mut worker).await {
+            match agent::work_one_in_lane(&pool, config.clone(), stop.clone(), &mut worker, lane)
+                .await
+            {
                 Ok(Worked::Done) => continue,
                 Ok(Worked::Idle) => {}
                 Ok(Worked::WorkerLost) => {
@@ -144,7 +163,7 @@ async fn monitors(pool: PgPool, config: Arc<Config>, stop: watch::Receiver<bool>
     let review = config.model_name.is_some() && config.model_base_url.is_some();
     tracing::info!(
         strands_review = review,
-        "Sales and Inventory monitors ready"
+        "Finance, Inventory and Procurement monitors ready"
     );
     while !*stop.borrow() {
         let cycle = async {

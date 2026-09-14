@@ -6,6 +6,9 @@ pub struct Config {
     pub database_url: String,
     pub bind: SocketAddr,
     pub api_key: String,
+    pub login: Option<crate::auth::Login>,
+    pub resend_key: Option<String>,
+    pub resend_from: Option<String>,
     pub cors_origin: String,
     pub workspace_id: String,
     pub db_max_connections: u32,
@@ -21,7 +24,13 @@ pub struct Config {
 }
 impl Config {
     pub fn from_env() -> Result<Self> {
-        dotenvy::dotenv().ok();
+        match dotenvy::dotenv() {
+            Ok(_) => {}
+            Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => anyhow::bail!(
+                "Could not load .env. Check its syntax and quote values containing spaces (including RESEND_FROM)."
+            ),
+        }
         let get = |key: &str, default: &str| env::var(key).unwrap_or_else(|_| default.into());
         let optional = |key: &str| env::var(key).ok().filter(|s| !s.trim().is_empty());
         let api_key = env::var("BACKEND_API_KEY").context("Set BACKEND_API_KEY")?;
@@ -31,9 +40,17 @@ impl Config {
         );
         let config = Self {
             database_url: env::var("DATABASE_URL").context("Set DATABASE_URL")?,
-            bind: get("BIND_ADDRESS", "127.0.0.1:8080").parse()?,
+            // Fixed demo endpoints: match the dashboard and its proxy on every start.
+            bind: "127.0.0.1:8090".parse()?,
             api_key,
-            cors_origin: get("CORS_ORIGIN", "http://localhost:5173"),
+            resend_key: optional("RESEND_API_KEY"),
+            resend_from: optional("RESEND_FROM"),
+            login: match (optional("DEMO_EMAIL"), optional("DEMO_PASSWORD")) {
+                (Some(email), Some(password)) => Some(crate::auth::Login::new(email, password)),
+                (None, None) => None,
+                _ => anyhow::bail!("Set both DEMO_EMAIL and DEMO_PASSWORD"),
+            },
+            cors_origin: "http://127.0.0.1:5173".into(),
             workspace_id: get("WORKSPACE_ID", "org_default"),
             db_max_connections: get("DB_MAX_CONNECTIONS", "4").parse()?,
             model_base_url: optional("MODEL_BASE_URL"),
@@ -79,5 +96,21 @@ impl Config {
             .parse::<axum::http::HeaderValue>()
             .context("Invalid CORS_ORIGIN")?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn email_sender_display_name_must_be_quoted() {
+        let invalid =
+            dotenvy::from_read_iter("RESEND_FROM=Backhaus <sender@example.test>\n".as_bytes())
+                .collect::<Result<Vec<_>, _>>();
+        assert!(invalid.is_err());
+        let values =
+            dotenvy::from_read_iter("RESEND_FROM=\"Backhaus <sender@example.test>\"\n".as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        assert_eq!(values[0].1, "Backhaus <sender@example.test>");
     }
 }

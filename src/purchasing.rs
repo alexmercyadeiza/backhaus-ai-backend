@@ -15,7 +15,6 @@ use uuid::Uuid;
 const MAX_CHECK_ITEMS: i64 = 500;
 const MAX_ATTENTION: usize = 25;
 pub const ACTOR_DASHBOARD: &str = "dashboard-operator";
-pub const ACTOR_POLICY: &str = "purchasing-policy";
 pub const ACTOR_AGENT: &str = "inventory-agent";
 
 #[derive(Clone, Debug)]
@@ -146,14 +145,13 @@ fn approval_reason(
     if !attention.is_empty() {
         return ("vendor_details_incomplete", false);
     }
-    if policy.auto_approve_limit > Decimal::ZERO && subtotal <= policy.auto_approve_limit {
-        return ("within_auto_approval_limit", true);
-    }
     if policy.auto_approve_limit > Decimal::ZERO {
-        ("exceeds_auto_approval_limit", false)
-    } else {
-        ("manual_approval_required", false)
+        if subtotal <= policy.auto_approve_limit {
+            return ("within_auto_approval_limit", true);
+        }
+        return ("exceeds_auto_approval_limit", false);
     }
+    ("manual_approval_required", false)
 }
 
 /// Open orders for the model and the dashboard, bounded and compact.
@@ -254,7 +252,7 @@ pub async fn prepare_drafts(
     let total_items: i64 = counts.try_get("total")?;
     let below_par: i64 = counts.try_get("below")?;
     let par_unset: i64 = counts.try_get("unset")?;
-    let rows = sqlx::query("SELECT i.id,i.name,i.par_level,i.current_balance,vi.vendor_id,v.name AS vendor_name,(v.email IS NULL AND v.phone IS NULL) AS contact_missing,vi.supplier_reference,vi.order_unit,vi.units_per_pack,vi.pack_price,vi.minimum_order_quantity,vi.reorder_target,COALESCE((SELECT SUM(l.quantity_units) FROM purchase_order_lines l JOIN purchase_orders o ON o.id=l.purchase_order_id WHERE l.workspace_id=i.workspace_id AND l.item_id=i.id AND o.status='approved'),0) AS on_order FROM inventory_items i LEFT JOIN vendor_items vi ON vi.workspace_id=i.workspace_id AND vi.item_id=i.id AND vi.preferred LEFT JOIN vendors v ON v.workspace_id=vi.workspace_id AND v.id=vi.vendor_id WHERE i.workspace_id=$1 AND i.par_level>0 AND i.current_balance<i.par_level ORDER BY i.name,i.id LIMIT $2")
+    let rows = sqlx::query("SELECT i.id,i.name,i.par_level,i.current_balance,CASE WHEN v.research_status='discarded' THEN NULL ELSE vi.vendor_id END AS vendor_id,v.name AS vendor_name,(v.email IS NULL AND v.phone IS NULL) AS contact_missing,vi.supplier_reference,vi.order_unit,vi.units_per_pack,vi.pack_price,vi.minimum_order_quantity,vi.reorder_target,COALESCE((SELECT SUM(l.quantity_units) FROM purchase_order_lines l JOIN purchase_orders o ON o.id=l.purchase_order_id WHERE l.workspace_id=i.workspace_id AND l.item_id=i.id AND o.status='approved'),0) AS on_order FROM inventory_items i LEFT JOIN vendor_items vi ON vi.workspace_id=i.workspace_id AND vi.item_id=i.id AND vi.preferred LEFT JOIN vendors v ON v.workspace_id=vi.workspace_id AND v.id=vi.vendor_id WHERE i.workspace_id=$1 AND i.par_level>0 AND i.current_balance<i.par_level ORDER BY i.name,i.id LIMIT $2")
         .bind(workspace).bind(MAX_CHECK_ITEMS).fetch_all(&mut **tx).await?;
     let mut attention: Vec<Value> = Vec::new();
     let mut covered = 0usize;
@@ -394,9 +392,10 @@ pub async fn prepare_drafts(
             (id, number, "drafted")
         };
         let status = if auto {
-            sqlx::query("UPDATE purchase_orders SET status='approved',approval_kind='automatic',decided_at=now(),decided_by=$2,updated_at=now(),vendor_snapshot=(SELECT jsonb_build_object('name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone) FROM vendors v WHERE v.workspace_id=purchase_orders.workspace_id AND v.id=purchase_orders.vendor_id) WHERE id=$1 AND status='draft'")
-                .bind(order_id).bind(ACTOR_POLICY).execute(&mut **tx).await?;
-            record_event(tx, workspace, order_id, "approved", ACTOR_POLICY, json!({"kind":"automatic","reason":reason,"subtotal":subtotal.to_string(),"auto_approve_limit":policy.auto_approve_limit.to_string()})).await?;
+            // Within the agent's limit: the agent records the approval itself; sending and payment stay disconnected.
+            sqlx::query("UPDATE purchase_orders SET status='approved',approval_kind='automatic',decided_at=now(),decided_by=$3,decision_note=$4,version=version+1,updated_at=now(),vendor_snapshot=(SELECT jsonb_build_object('name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone) FROM vendors v WHERE v.workspace_id=purchase_orders.workspace_id AND v.id=purchase_orders.vendor_id) WHERE workspace_id=$1 AND id=$2 AND status='draft'")
+                .bind(workspace).bind(order_id).bind(ACTOR_AGENT).bind(describe_reason(reason)).execute(&mut **tx).await?;
+            record_event(tx, workspace, order_id, "approved", ACTOR_AGENT, json!({"kind":"automatic","note":describe_reason(reason),"subtotal":subtotal.to_string()})).await?;
             auto_approved += 1;
             "approved"
         } else {
@@ -746,7 +745,7 @@ pub async fn export_pdf(
     };
     let (status_label, watermark, prepared_label) = match status {
         "draft" => (
-            "DRAFT — awaiting approval",
+            "DRAFT (awaiting approval)",
             "Draft: not approved, not sent, not an order confirmation",
             format!("Prepared {} UTC", when("created_at")),
         ),

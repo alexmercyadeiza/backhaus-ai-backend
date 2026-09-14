@@ -156,7 +156,7 @@ pub async fn vendor_json(
     workspace: &str,
     id: Uuid,
 ) -> Result<Value> {
-    sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',v.id,'name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone,'notes',v.notes,'source',v.source,'version',v.version,'created_at',v.created_at,'updated_at',v.updated_at,'item_count',(SELECT COUNT(*) FROM vendor_items vi WHERE vi.workspace_id=v.workspace_id AND vi.vendor_id=v.id),'open_orders',(SELECT COUNT(*) FROM purchase_orders o WHERE o.workspace_id=v.workspace_id AND o.vendor_id=v.id AND o.status IN ('draft','approved'))) FROM vendors v WHERE v.workspace_id=$1 AND v.id=$2")
+    sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',v.id,'name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone,'notes',v.notes,'source',v.source,'website',v.website,'evidence',v.evidence,'vetting',v.vetting,'research_status',v.research_status,'version',v.version,'created_at',v.created_at,'updated_at',v.updated_at,'item_count',(SELECT COUNT(*) FROM vendor_items vi WHERE vi.workspace_id=v.workspace_id AND vi.vendor_id=v.id),'open_orders',(SELECT COUNT(*) FROM purchase_orders o WHERE o.workspace_id=v.workspace_id AND o.vendor_id=v.id AND o.status IN ('draft','approved'))) FROM vendors v WHERE v.workspace_id=$1 AND v.id=$2")
         .bind(workspace).bind(id).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)
 }
 
@@ -404,7 +404,7 @@ pub async fn page(pool: &PgPool, workspace: &str, requested: i64) -> Result<Valu
         .await?;
     let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
     let page = requested.min(pages).max(1);
-    let items = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',v.id,'name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone,'source',v.source,'version',v.version,'updated_at',v.updated_at,'item_count',(SELECT COUNT(*) FROM vendor_items vi WHERE vi.workspace_id=v.workspace_id AND vi.vendor_id=v.id),'open_orders',(SELECT COUNT(*) FROM purchase_orders o WHERE o.workspace_id=v.workspace_id AND o.vendor_id=v.id AND o.status IN ('draft','approved'))) FROM vendors v WHERE v.workspace_id=$1 ORDER BY v.name,v.id LIMIT $2 OFFSET $3")
+    let items = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',v.id,'name',v.name,'contact_name',v.contact_name,'email',v.email,'phone',v.phone,'source',v.source,'website',v.website,'evidence',v.evidence,'vetting',v.vetting,'research_status',v.research_status,'version',v.version,'updated_at',v.updated_at,'item_count',(SELECT COUNT(*) FROM vendor_items vi WHERE vi.workspace_id=v.workspace_id AND vi.vendor_id=v.id),'open_orders',(SELECT COUNT(*) FROM purchase_orders o WHERE o.workspace_id=v.workspace_id AND o.vendor_id=v.id AND o.status IN ('draft','approved'))) FROM vendors v WHERE v.workspace_id=$1 ORDER BY v.name,v.id LIMIT $2 OFFSET $3")
         .bind(workspace).bind(PAGE_SIZE).bind((page - 1) * PAGE_SIZE).fetch_all(&mut *tx).await?;
     tx.commit().await?;
     Ok(
@@ -461,7 +461,7 @@ pub async fn update_policy(pool: &PgPool, workspace: &str, input: &PolicyInput) 
         || input.auto_approve_limit > Decimal::from(1_000_000_000)
     {
         return Err(Error::Invalid(
-            "Automatic approval limit must be zero or more with at most 2 decimals".into(),
+            "The agent approval limit must be zero or more with at most 2 decimals".into(),
         ));
     }
     if let Some(limit) = input.approval_limit {

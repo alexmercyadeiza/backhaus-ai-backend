@@ -76,7 +76,7 @@ export function parseInbound(line: string): Inbound {
         return { name: definition.name, description: definition.description, input_schema: definition.input_schema };
       });
       const limits = value.limits;
-      if (!isRecord(limits) || !isPositiveInt(limits.turns, 32) || !isPositiveInt(limits.output_tokens, 32_000) || !isPositiveInt(limits.max_output_chars, 1_000_000) || !isPositiveInt(limits.timeout_ms, 3_600_000) || !isPositiveInt(limits.tool_timeout_ms, 600_000)) throw new Error('Invalid run limits');
+      if (!isRecord(limits) || !isPositiveInt(limits.turns, 64) || !isPositiveInt(limits.output_tokens, 32_000) || !isPositiveInt(limits.max_output_chars, 1_000_000) || !isPositiveInt(limits.timeout_ms, 3_600_000) || !isPositiveInt(limits.tool_timeout_ms, 600_000)) throw new Error('Invalid run limits');
       return {
         type: 'run', run_id: value.run_id, kind: value.kind, system_prompt: value.system_prompt, message: value.message, history, tools,
         limits: { turns: limits.turns, output_tokens: limits.output_tokens, max_output_chars: limits.max_output_chars, timeout_ms: limits.timeout_ms, tool_timeout_ms: limits.tool_timeout_ms },

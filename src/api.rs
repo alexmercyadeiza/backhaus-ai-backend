@@ -1,9 +1,11 @@
 use crate::{
+    auth,
     config::Config,
     conversations,
     data::{self, DateRange, InventoryQuery},
     error::{Error, Result},
-    inventory, jobs, purchasing, reports, scoped_agents, tables, vendors,
+    inventory, jobs, outreach, purchasing, reports, research, scoped_agents, settings, tables,
+    vendors,
 };
 use axum::{
     Json, Router,
@@ -56,6 +58,35 @@ pub fn router(state: AppState) -> Router {
         ]);
     let protected = Router::new()
         .route("/v1/status", get(status))
+        .route(
+            "/v1/settings",
+            get(business_settings).put(save_business_settings),
+        )
+        .route("/v1/procurement/tasks", get(procurement_tasks))
+        .route("/v1/vendors/research", post(vendor_research))
+        .route("/v1/vendors/research/{id}/more", post(more_vendor_research))
+        .route(
+            "/v1/vendors/research/{id}/retry",
+            post(retry_vendor_research),
+        )
+        .route(
+            "/v1/vendors/research/{id}/discard",
+            post(discard_vendor_research),
+        )
+        .route("/v1/vendors/{id}/outreach", post(create_outreach))
+        .route("/v1/vendors/{id}/enquiries", get(vendor_enquiries))
+        .route("/v1/vendors/{id}/selection", post(select_candidate))
+        .route(
+            "/v1/vendors/{id}/approve-outreach",
+            post(approve_candidate_outreach),
+        )
+        .route("/v1/outreach/sync", post(sync_outreach))
+        .route("/v1/outreach/{id}", get(outreach_detail))
+        .route("/v1/outreach/{id}/email", post(email_outreach))
+        .route("/v1/outreach/{id}/whatsapp", post(whatsapp_outreach))
+        .route("/v1/outreach/{id}/replies", post(paste_outreach_reply))
+        .route("/v1/outreach/{id}/discard", post(discard_outreach))
+        .route("/v1/outreach/{id}/draft", post(draft_outreach_reply))
         .route("/v1/coverage", get(coverage))
         .route("/v1/sales/summary", get(sales))
         .route("/v1/inventory", get(inventory))
@@ -94,6 +125,9 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
+        .route("/v1/auth/login", post(auth::sign_in))
+        .route("/v1/auth/session", get(auth::session))
+        .route("/v1/auth/logout", post(auth::sign_out))
         .merge(protected)
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(cors)
@@ -110,6 +144,28 @@ async fn authenticate(State(state): State<AppState>, request: Request, next: Nex
     let actual = Sha256::digest(supplied.as_bytes());
     let expected = Sha256::digest(state.config.api_key.as_bytes());
     if !bool::from(actual.ct_eq(&expected)) {
+        if state
+            .config
+            .login
+            .as_ref()
+            .is_some_and(|login| login.valid(request.headers()))
+        {
+            if request.method() != axum::http::Method::GET
+                && request.method() != axum::http::Method::HEAD
+                && !auth::same_origin(request.headers(), &state.config.cors_origin)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error":"Request must come from the dashboard."})),
+                )
+                    .into_response();
+            }
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            return response;
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"Unauthorized"})),
@@ -479,5 +535,140 @@ async fn table_detail(
 ) -> Result<Json<Value>> {
     Ok(Json(
         tables::detail(&s.pool, &s.config.workspace_id, &kind, &id, &query).await?,
+    ))
+}
+async fn business_settings(State(s): State<AppState>) -> Result<Json<Value>> {
+    Ok(Json(
+        settings::get(&s.pool, &s.config.workspace_id, &s.config).await?,
+    ))
+}
+async fn save_business_settings(
+    State(s): State<AppState>,
+    Json(input): Json<settings::SettingsInput>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        settings::save(&s.pool, &s.config.workspace_id, &s.config, input).await?,
+    ))
+}
+async fn procurement_tasks(State(s): State<AppState>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::tasks(&s.pool, &s.config.workspace_id, &s.config).await?,
+    ))
+}
+async fn vendor_research(
+    State(s): State<AppState>,
+    Json(input): Json<research::ResearchRequest>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        research::start(&s.pool, &s.config.workspace_id, &s.config, input).await?,
+    ))
+}
+async fn retry_vendor_research(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        research::retry(&s.pool, &s.config.workspace_id, &s.config, id).await?,
+    ))
+}
+async fn discard_vendor_research(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        research::discard(&s.pool, &s.config.workspace_id, id).await?,
+    ))
+}
+async fn create_outreach(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<outreach::Create>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::create(&s.pool, &s.config.workspace_id, &s.config, id, input).await?,
+    ))
+}
+async fn approve_candidate_outreach(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::approve_candidate(&s.pool, &s.config.workspace_id, &s.config, id).await?,
+    ))
+}
+async fn select_candidate(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<outreach::CandidateAction>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::candidate_action(&s.pool, &s.config.workspace_id, id, input).await?,
+    ))
+}
+async fn outreach_detail(State(s): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::detail(&s.pool, &s.config.workspace_id, id).await?,
+    ))
+}
+async fn email_outreach(State(s): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::send_email(&s.pool, &s.config.workspace_id, &s.config, id, None).await?,
+    ))
+}
+async fn whatsapp_outreach(State(s): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::whatsapp(&s.pool, &s.config.workspace_id, id).await?,
+    ))
+}
+async fn paste_outreach_reply(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<outreach::PasteReply>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::paste_reply(&s.pool, &s.config.workspace_id, id, input).await?,
+    ))
+}
+async fn discard_outreach(State(s): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::discard(&s.pool, &s.config.workspace_id, id).await?,
+    ))
+}
+async fn sync_outreach(State(s): State<AppState>) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::sync(&s.pool, &s.config.workspace_id, &s.config).await?,
+    ))
+}
+
+async fn draft_outreach_reply(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<outreach::ReplyDraft>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::draft_reply(&s.pool, &s.config.workspace_id, id, input).await?,
+    ))
+}
+#[derive(Deserialize)]
+struct EnquiryQuery {
+    page: Option<i64>,
+}
+async fn vendor_enquiries(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<EnquiryQuery>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        outreach::enquiries(&s.pool, &s.config.workspace_id, id, q.page.unwrap_or(1)).await?,
+    ))
+}
+
+async fn more_vendor_research(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<research::MoreRequest>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        research::more(&s.pool, &s.config.workspace_id, &s.config, id, input).await?,
     ))
 }

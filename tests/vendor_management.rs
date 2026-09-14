@@ -300,7 +300,7 @@ async fn policy_thresholds_are_exact_and_versioned() {
         &pool,
         w,
         &PolicyInput {
-            auto_approve_limit: "800".parse().unwrap(),
+            auto_approve_limit: "0".parse().unwrap(),
             approval_limit: Some("5000".parse().unwrap()),
             version: 0,
         },
@@ -311,17 +311,27 @@ async fn policy_thresholds_are_exact_and_versioned() {
     drain(&pool, w).await;
     let o = orders(&pool, w).await;
     assert_eq!(
-        o[0]["status"], "approved",
-        "exactly at the automatic limit is approved: {o:?}"
+        o[0]["status"], "draft",
+        "all orders wait for a person: {o:?}"
     );
-    assert_eq!(o[0]["approval_kind"], "automatic");
+    assert!(o[0]["approval_kind"].is_null());
+    purchasing::decide(
+        &pool,
+        w,
+        o[0]["id"].as_str().unwrap().parse().unwrap(),
+        "approve",
+        "tester",
+        None,
+    )
+    .await
+    .unwrap();
     // Lower the automatic limit by one kobo: a new shortage at the same vendor needs manual approval.
     assert!(
         vendors::update_policy(
             &pool,
             w,
             &PolicyInput {
-                auto_approve_limit: "799.99".parse().unwrap(),
+                auto_approve_limit: "0".parse().unwrap(),
                 approval_limit: Some("5000".parse().unwrap()),
                 version: 0
             }
@@ -334,7 +344,7 @@ async fn policy_thresholds_are_exact_and_versioned() {
         &pool,
         w,
         &PolicyInput {
-            auto_approve_limit: "799.99".parse().unwrap(),
+            auto_approve_limit: "0".parse().unwrap(),
             approval_limit: Some("5000".parse().unwrap()),
             version: 1,
         },
@@ -348,7 +358,7 @@ async fn policy_thresholds_are_exact_and_versioned() {
         .iter()
         .find(|x| x["status"] == "draft")
         .expect("new draft");
-    assert_eq!(draft["approval_reason"], "exceeds_auto_approval_limit");
+    assert_eq!(draft["approval_reason"], "manual_approval_required");
     assert_eq!(d(&draft["subtotal"]), Decimal::from(800));
     // Approval limit boundary: exactly at the limit approves; one kobo above is refused.
     let id: Uuid = draft["id"].as_str().unwrap().parse().unwrap();
@@ -385,6 +395,39 @@ async fn policy_thresholds_are_exact_and_versioned() {
             .unwrap()["status"],
         "approved"
     );
+    // Within the agent limit: the agent approves the next order itself.
+    let raised = vendors::update_policy(
+        &pool,
+        w,
+        &PolicyInput {
+            auto_approve_limit: "5000".parse().unwrap(),
+            approval_limit: None,
+            version: 4,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(raised["auto_approve_limit"], "5000");
+    assign(&pool, w, "item-4", v, Some("100"), "1", "1", None).await;
+    drain(&pool, w).await;
+    let auto = orders(&pool, w)
+        .await
+        .into_iter()
+        .find(|x| x["approval_kind"] == "automatic")
+        .expect("an order approved by the agent");
+    assert_eq!(auto["status"], "approved");
+    assert_eq!(auto["approval_reason"], "within_auto_approval_limit");
+    vendors::update_policy(
+        &pool,
+        w,
+        &PolicyInput {
+            auto_approve_limit: "0".parse().unwrap(),
+            approval_limit: None,
+            version: 5,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

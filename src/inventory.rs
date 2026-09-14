@@ -154,6 +154,7 @@ pub async fn record(
         .execute(&mut *tx)
         .await?;
     let status = match par {
+        _ if balance <= Decimal::ZERO => "Out of stock",
         Some(p) if p > Decimal::ZERO && balance < p => "Below par",
         Some(p) if p > Decimal::ZERO => "In stock",
         _ => "Par not set",

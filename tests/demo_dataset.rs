@@ -204,8 +204,8 @@ async fn synthetic_dataset_matches_the_documented_scenario_and_is_deterministic(
     let orders = common::orders(&pool, &w).await;
     let by_vendor = |name: &str| orders.iter().find(|o| o["vendor"] == name).cloned();
     let lemons = by_vendor("Lagoon Fresh Produce").expect("produce order");
-    assert_eq!(lemons["status"], "approved");
-    assert_eq!(lemons["approval_kind"], "automatic");
+    assert_eq!(lemons["status"], "draft");
+    assert!(lemons["approval_kind"].is_null());
     assert_eq!(
         lemons["subtotal"]
             .as_str()
@@ -216,7 +216,7 @@ async fn synthetic_dataset_matches_the_documented_scenario_and_is_deterministic(
     );
     let chicken = by_vendor("Harbour Proteins").expect("proteins order");
     assert_eq!(chicken["status"], "draft");
-    assert_eq!(chicken["approval_reason"], "exceeds_auto_approval_limit");
+    assert_eq!(chicken["approval_reason"], "manual_approval_required");
     assert_eq!(
         chicken["subtotal"]
             .as_str()
@@ -327,8 +327,8 @@ async fn reset_is_guarded_scoped_and_clears_derived_state() {
     .unwrap();
     assert_eq!(
         state,
-        (true, -1),
-        "agents re-enabled with cleared checkpoints"
+        (false, -1),
+        "Finance remains paused with cleared checkpoints"
     );
     // Untouched: the other demo workspace and the snapshot workspace.
     assert_eq!(

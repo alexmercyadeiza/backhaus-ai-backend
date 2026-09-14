@@ -12,9 +12,15 @@ const PAGE_SIZE: i64 = 20;
 #[serde(deny_unknown_fields)]
 pub struct TableQuery {
     pub page: Option<i64>,
-    /// Purchase orders only: draft | approved | rejected | withdrawn | open (draft or approved).
+    /// Purchase orders: draft | approved | rejected | withdrawn | open (draft or approved).
+    /// Inventory: below_par | out_of_stock | in_stock | par_not_set.
     pub status: Option<String>,
+    /// Inventory only: case-insensitive match on item name or category.
+    pub search: Option<String>,
 }
+
+/// Stock status label; the SQL below must stay in step with this.
+const INVENTORY_STATUS_SQL: &str = "CASE WHEN current_balance<=0 THEN 'Out of stock' WHEN par_level IS NULL OR par_level<=0 THEN 'Par not set' WHEN current_balance<par_level THEN 'Below par' ELSE 'In stock' END";
 
 pub async fn page(pool: &PgPool, workspace: &str, kind: &str, query: &TableQuery) -> Result<Value> {
     let requested = query.page.unwrap_or(1);
@@ -26,10 +32,16 @@ pub async fn page(pool: &PgPool, workspace: &str, kind: &str, query: &TableQuery
             "SELECT COUNT(*) FROM sales_tickets WHERE workspace_id=$1",
             "SELECT jsonb_build_object('id',t.id::text,'ticket_number',t.ticket_number,'business_date',t.business_date,'department',t.source->>'departmentName','line_count',l.lines,'gross_line_sales',COALESCE(l.gross,0)::text,'ticket_total',t.total_amount::text) FROM (SELECT * FROM sales_tickets WHERE workspace_id=$1 ORDER BY business_date DESC,id DESC LIMIT $2 OFFSET $3) t LEFT JOIN LATERAL (SELECT COUNT(*) AS lines,SUM(quantity*unit_price) FILTER(WHERE billable AND t.total_amount<>0) AS gross FROM sales_lines WHERE workspace_id=t.workspace_id AND ticket_id=t.id) l ON true ORDER BY t.business_date DESC,t.id DESC",
         ),
-        "inventory" => (
-            "SELECT COUNT(*) FROM inventory_items WHERE workspace_id=$1",
-            "SELECT jsonb_build_object('id',id,'name',name,'category',category,'unit',unit,'balance',current_balance::text,'par_level',par_level::text,'unit_cost',unit_cost::text,'status',CASE WHEN par_level IS NULL OR par_level<=0 THEN 'Par not set' WHEN current_balance<par_level THEN 'Below par' ELSE 'In stock' END) FROM inventory_items WHERE workspace_id=$1 ORDER BY name,id LIMIT $2 OFFSET $3",
-        ),
+        "inventory" => {
+            return inventory_page(
+                pool,
+                workspace,
+                requested,
+                query.status.as_deref(),
+                query.search.as_deref(),
+            )
+            .await;
+        }
         "menu" => (
             "SELECT COUNT(*) FROM menu_items WHERE workspace_id=$1",
             "SELECT jsonb_build_object('id',id::text,'name',name,'category',category,'portions',jsonb_array_length(portions),'price_min',price_min::text,'price_max',price_max::text) FROM menu_items WHERE workspace_id=$1 ORDER BY name,id LIMIT $2 OFFSET $3",
@@ -42,8 +54,11 @@ pub async fn page(pool: &PgPool, workspace: &str, kind: &str, query: &TableQuery
     };
     if query.status.is_some() {
         return Err(Error::Invalid(
-            "Status filters apply to purchase orders only".into(),
+            "Status filters apply to purchase orders and inventory only".into(),
         ));
+    }
+    if query.search.is_some() {
+        return Err(Error::Invalid("Search applies to inventory only".into()));
     }
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -61,6 +76,67 @@ pub async fn page(pool: &PgPool, workspace: &str, kind: &str, query: &TableQuery
         .bind((page - 1) * PAGE_SIZE)
         .fetch_all(&mut *tx)
         .await?;
+    tx.commit().await?;
+    Ok(
+        json!({"items":items,"total":total,"page":page,"page_size":PAGE_SIZE,"pages":pages,"available":true}),
+    )
+}
+
+async fn inventory_page(
+    pool: &PgPool,
+    workspace: &str,
+    requested: i64,
+    status: Option<&str>,
+    search: Option<&str>,
+) -> Result<Value> {
+    let status = match status {
+        None => None,
+        Some("below_par") => Some("Below par"),
+        Some("out_of_stock") => Some("Out of stock"),
+        Some("in_stock") => Some("In stock"),
+        Some("par_not_set") => Some("Par not set"),
+        Some(_) => return Err(Error::Invalid("Unknown inventory status filter".into())),
+    };
+    let search = search.map(str::trim).filter(|s| !s.is_empty());
+    if search.is_some_and(|s| s.chars().count() > 120) {
+        return Err(Error::Invalid(
+            "Search must be 120 characters or fewer".into(),
+        ));
+    }
+    // Escape LIKE wildcards so a literal "%" in the search stays literal.
+    let pattern = search.map(|s| {
+        format!(
+            "%{}%",
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )
+    });
+    let filter = format!(
+        "WHERE workspace_id=$1 AND ($2::text IS NULL OR {INVENTORY_STATUS_SQL}=$2) AND ($3::text IS NULL OR name ILIKE $3 OR category ILIKE $3)"
+    );
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM inventory_items {filter}"))
+        .bind(workspace)
+        .bind(status)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+    let pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
+    let page = requested.min(pages);
+    let items = sqlx::query_scalar::<_, Value>(&format!(
+        "SELECT jsonb_build_object('id',id,'name',name,'category',category,'unit',unit,'balance',current_balance::text,'par_level',par_level::text,'unit_cost',unit_cost::text,'status',{INVENTORY_STATUS_SQL}) FROM inventory_items {filter} ORDER BY name,id LIMIT $4 OFFSET $5"
+    ))
+    .bind(workspace)
+    .bind(status)
+    .bind(&pattern)
+    .bind(PAGE_SIZE)
+    .bind((page - 1) * PAGE_SIZE)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(
         json!({"items":items,"total":total,"page":page,"page_size":PAGE_SIZE,"pages":pages,"available":true}),

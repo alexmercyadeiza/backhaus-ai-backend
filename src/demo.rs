@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub const RESTAURANT_NAME: &str = "Harmattan House (fictional demo restaurant)";
 pub const DEFAULT_SEED: u64 = 20260914;
 pub const SALES_DAYS: i64 = 61;
-pub const POLICY_AUTO_APPROVE: &str = "20000";
+pub const POLICY_AUTO_APPROVE: &str = "0";
 pub const POLICY_APPROVAL_LIMIT: &str = "250000";
 
 /// SplitMix64: tiny, dependency-free, deterministic.
@@ -1152,7 +1152,7 @@ async fn clear(tx: &mut Transaction<'_, Postgres>, workspace: &str) -> Result<Va
     }
     // Predictable starting state: both agents enabled, checkpoints cleared, one
     // fresh revision so the first check runs once against the new data.
-    sqlx::query("UPDATE scoped_agents SET enabled=true,checked_revision=-1,last_checked_at=NULL,observation=NULL,updated_at=now() WHERE workspace_id=$1")
+    sqlx::query("UPDATE scoped_agents SET enabled=(role IN ('inventory','procurement')),checked_revision=CASE WHEN role='procurement' THEN 0 ELSE -1 END,last_checked_at=NULL,observation=NULL,updated_at=now() WHERE workspace_id=$1")
         .bind(workspace).execute(&mut **tx).await?;
     sqlx::query("UPDATE agent_data_revisions SET revision=0 WHERE workspace_id=$1")
         .bind(workspace)

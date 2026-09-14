@@ -14,8 +14,42 @@ use uuid::Uuid;
 pub async fn list(pool: &PgPool, workspace: &str) -> Result<Value> {
     let online: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_monitor_instances WHERE workspace_id=$1 AND heartbeat_at>now()-interval '15 seconds')")
         .bind(workspace).fetch_one(pool).await?;
-    let agents = sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('id',a.role,'enabled',a.enabled,'checked_revision',a.checked_revision,'data_revision',r.revision,'last_checked_at',a.last_checked_at,'observation',a.observation,'status',CASE WHEN NOT a.enabled THEN 'paused' WHEN NOT $2 THEN 'offline' WHEN a.checked_revision<r.revision THEN 'pending' ELSE 'watching' END,'review',CASE WHEN a.role='inventory' THEN (SELECT jsonb_build_object('run_id',x.id,'status',x.status,'revision',(x.input->>'revision')::bigint,'error_code',x.error_code,'updated_at',x.updated_at) FROM agent_runs x WHERE x.workspace_id=a.workspace_id AND x.kind='inventory_review' ORDER BY x.created_at DESC,x.id DESC LIMIT 1) END) FROM scoped_agents a JOIN agent_data_revisions r USING(workspace_id,role) WHERE a.workspace_id=$1 ORDER BY CASE a.role WHEN 'sales' THEN 0 ELSE 1 END")
+    let mut agents = sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('id',a.role,'enabled',a.enabled,'checked_revision',a.checked_revision,'data_revision',r.revision,'last_checked_at',a.last_checked_at,'observation',a.observation,'status',CASE WHEN NOT a.enabled THEN 'paused' WHEN NOT $2 THEN 'offline' WHEN a.checked_revision<r.revision THEN 'pending' ELSE 'watching' END,'review',CASE WHEN a.role='inventory' THEN (SELECT jsonb_build_object('run_id',x.id,'status',x.status,'revision',(x.input->>'revision')::bigint,'error_code',x.error_code,'updated_at',x.updated_at) FROM agent_runs x WHERE x.workspace_id=a.workspace_id AND x.kind='inventory_review' ORDER BY x.created_at DESC,x.id DESC LIMIT 1) END) FROM scoped_agents a JOIN agent_data_revisions r USING(workspace_id,role) WHERE a.workspace_id=$1 ORDER BY CASE a.role WHEN 'sales' THEN 0 WHEN 'inventory' THEN 1 ELSE 2 END")
         .bind(workspace).bind(online).fetch_all(pool).await?;
+    for agent in &mut agents {
+        if agent["id"] != "procurement" {
+            continue;
+        }
+        let activity: Value = sqlx::query_scalar("WITH latest AS (SELECT DISTINCT ON (vendor_id) vendor_id,status FROM supplier_threads WHERE workspace_id=$1 ORDER BY vendor_id,(status='discarded'),updated_at DESC,id DESC) SELECT jsonb_build_object('waiting',(SELECT count(DISTINCT vendor_id) FROM latest WHERE status='awaiting_reply'),'offers',(SELECT count(DISTINCT vendor_id) FROM latest WHERE status='offer_ready'),'attention',(SELECT count(DISTINCT vendor_id) FROM latest WHERE status IN ('needs_attention','send_failed')),'working',(SELECT kind FROM agent_runs WHERE workspace_id=$1 AND kind IN ('vendor_research','supplier_reply') AND status IN ('running','queued') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,created_at LIMIT 1),'last_checked',(SELECT max(updated_at) FROM agent_runs WHERE workspace_id=$1 AND kind IN ('vendor_research','supplier_reply')))")
+            .bind(workspace).fetch_one(pool).await?;
+        let mut parts = Vec::new();
+        for (key, singular, plural) in [
+            (
+                "waiting",
+                "supplier awaiting a response",
+                "suppliers awaiting responses",
+            ),
+            ("offers", "offer ready", "offers ready"),
+            (
+                "attention",
+                "enquiry needs attention",
+                "enquiries need attention",
+            ),
+        ] {
+            let count = activity[key].as_i64().unwrap_or(0);
+            if count > 0 {
+                parts.push(format!(
+                    "{count} {}",
+                    if count == 1 { singular } else { plural }
+                ));
+            }
+        }
+        agent["observation"] = json!({"summary":if parts.is_empty(){"Ready to find suppliers".into()}else{parts.join(" · ")},"working":activity["working"]});
+        agent["last_checked_at"] = activity["last_checked"].clone();
+        if agent["enabled"] == true && online && !activity["working"].is_null() {
+            agent["status"] = json!("pending");
+        }
+    }
     Ok(json!({"agents":agents,"monitor_online":online}))
 }
 
@@ -25,18 +59,28 @@ pub async fn control(pool: &PgPool, workspace: &str, role: &str, action: &str) -
         "resume" => true,
         _ => return Err(Error::Invalid("Use pause or resume".into())),
     };
+    let mut tx = pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE scoped_agents SET enabled=$3,updated_at=now() WHERE workspace_id=$1 AND role=$2",
     )
     .bind(workspace)
     .bind(role)
     .bind(enabled)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if updated == 0 {
         return Err(Error::NotFound);
     }
+    if role == "procurement" {
+        let query = if enabled {
+            "WITH changed AS (UPDATE agent_runs SET status='queued',error_code=NULL,available_at=now(),updated_at=now() WHERE workspace_id=$1 AND kind IN ('vendor_research','supplier_reply') AND status='paused' AND error_code='procurement_paused' RETURNING id) INSERT INTO agent_events(run_id,event_type,payload) SELECT id,'queued','{\"reason\":\"procurement_resumed\"}'::jsonb FROM changed"
+        } else {
+            "WITH changed AS (UPDATE agent_runs SET status='paused',error_code='procurement_paused',attempt=GREATEST(attempt-CASE WHEN status='running' THEN 1 ELSE 0 END,0),lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workspace_id=$1 AND kind IN ('vendor_research','supplier_reply') AND status IN ('queued','running') RETURNING id) INSERT INTO agent_events(run_id,event_type,payload) SELECT id,'paused','{\"reason\":\"procurement_paused\"}'::jsonb FROM changed"
+        };
+        sqlx::query(query).bind(workspace).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     tracing::info!(agent = role, enabled, "Agent monitoring changed");
     list(pool, workspace).await
 }
@@ -67,7 +111,7 @@ pub async fn check_one(pool: &PgPool, workspace: &str, review: bool) -> Result<b
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
-    let row=sqlx::query("SELECT a.role,r.revision FROM scoped_agents a JOIN agent_data_revisions r USING(workspace_id,role) WHERE a.workspace_id=$1 AND a.enabled AND a.checked_revision<r.revision ORDER BY a.role FOR UPDATE OF a SKIP LOCKED LIMIT 1")
+    let row=sqlx::query("SELECT a.role,r.revision FROM scoped_agents a JOIN agent_data_revisions r USING(workspace_id,role) WHERE a.workspace_id=$1 AND a.role IN ('sales','inventory') AND a.enabled AND a.checked_revision<r.revision ORDER BY a.role FOR UPDATE OF a SKIP LOCKED LIMIT 1")
         .bind(workspace).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         return Ok(false);

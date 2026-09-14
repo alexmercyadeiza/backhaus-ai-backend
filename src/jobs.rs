@@ -96,12 +96,30 @@ pub async fn enqueue_system(
     Ok(inserted)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    All,
+    Chat,
+    Background,
+}
+impl Lane {
+    fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Chat => "chat",
+            Self::Background => "background",
+        }
+    }
+}
 pub async fn claim(pool: &PgPool, workspace: &str) -> Result<Option<Run>> {
+    claim_in_lane(pool, workspace, Lane::All).await
+}
+pub async fn claim_in_lane(pool: &PgPool, workspace: &str, lane: Lane) -> Result<Option<Run>> {
     let mut tx = pool.begin().await?;
     sqlx::query("WITH recovered AS (UPDATE agent_runs SET status=CASE WHEN attempt<max_attempts THEN 'queued' ELSE 'failed' END, error_code='worker_lease_expired',lease_token=NULL,lease_until=NULL,updated_at=now() WHERE workspace_id=$1 AND status='running' AND lease_until<now() RETURNING id,status) INSERT INTO agent_events(run_id,event_type,payload) SELECT id,status,jsonb_build_object('reason','worker_lease_expired') FROM recovered").bind(workspace).execute(&mut *tx).await?;
     let lease = Uuid::new_v4();
-    let row=sqlx::query("UPDATE agent_runs SET status='running',attempt=attempt+1,lease_token=$2,lease_until=now()+interval '30 seconds',updated_at=now() WHERE id=(SELECT id FROM agent_runs WHERE workspace_id=$1 AND status='queued' AND available_at<=now() ORDER BY CASE WHEN kind='chat' THEN 0 ELSE 1 END,created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,workspace_id,conversation_id,input,attempt,kind")
-        .bind(workspace).bind(lease).fetch_optional(&mut *tx).await?;
+    let row=sqlx::query("UPDATE agent_runs SET status='running',attempt=attempt+1,lease_token=$2,lease_until=now()+interval '30 seconds',updated_at=now() WHERE id=(SELECT id FROM agent_runs WHERE workspace_id=$1 AND status='queued' AND available_at<=now() AND ($3='all' OR ($3='chat' AND kind='chat') OR ($3='background' AND kind<>'chat')) AND (kind NOT IN ('vendor_research','supplier_reply') OR EXISTS(SELECT 1 FROM scoped_agents a WHERE a.workspace_id=agent_runs.workspace_id AND a.role='procurement' AND a.enabled)) ORDER BY CASE WHEN kind='chat' THEN 0 ELSE 1 END,created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,workspace_id,conversation_id,input,attempt,kind")
+        .bind(workspace).bind(lease).bind(lane.name()).fetch_optional(&mut *tx).await?;
     let run = if let Some(r) = row {
         let id: Uuid = r.try_get("id")?;
         sqlx::query(

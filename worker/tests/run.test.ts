@@ -119,6 +119,8 @@ test('protocol parsing rejects malformed and unbounded input', () => {
   assert.throws(() => parseInbound(JSON.stringify({ type: 'run', run_id: 'x' })));
   assert.throws(() => parseInbound(JSON.stringify({ ...request(), tools: [{ name: 'Bad Name', description: 'x', input_schema: {} }] })));
   assert.throws(() => parseInbound(JSON.stringify({ ...request(), limits: { turns: 999 } })));
+  assert.equal(parseInbound(JSON.stringify(request({ limits: { ...request().limits, turns: 64, timeout_ms: 1_800_000 } }))).type, 'run');
+  assert.throws(() => parseInbound(JSON.stringify(request({ limits: { ...request().limits, turns: 65 } }))));
   const parsed = parseInbound(JSON.stringify(request()));
   assert.equal(parsed.type, 'run');
   assert.equal(parseInbound('{"type":"cancel","run_id":"run-1"}').type, 'cancel');

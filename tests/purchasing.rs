@@ -67,7 +67,7 @@ fn ordering_rule_rounds_up_respects_minimums_and_open_orders() {
     );
     assert_eq!(p("2.8", "5", None, "0", "1", "1"), Some(d("3")));
     assert_eq!(p("2", "10", None, "0", "0", "1"), None);
-    assert!(purchasing::describe_reason("exceeds_auto_approval_limit").len() > 10);
+    assert!(purchasing::describe_reason("manual_approval_required").len() > 10);
 }
 
 #[tokio::test]
@@ -95,10 +95,7 @@ async fn below_par_items_become_costed_drafts_and_missing_details_are_surfaced()
     assert_eq!(alpha_order["status"], "draft");
     assert_eq!(alpha_order["line_count"], 3);
     assert_eq!(d(alpha_order["subtotal"].as_str().unwrap()), d("1130.00"));
-    assert_eq!(
-        alpha_order["approval_reason"],
-        "exceeds_auto_approval_limit"
-    );
+    assert_eq!(alpha_order["approval_reason"], "exceeds_auto_approval_limit");
     let beta_order = find(orders, "Beta Supplies");
     assert_eq!(beta_order["line_count"], 1);
     assert_eq!(beta_order["approval_reason"], "vendor_details_incomplete");
@@ -108,7 +105,9 @@ async fn below_par_items_become_costed_drafts_and_missing_details_are_surfaced()
     );
     let gamma_order = find(orders, "Gamma Wholesale");
     assert_eq!(gamma_order["status"], "approved");
+    assert_eq!(observation["auto_approved"], 1);
     assert_eq!(gamma_order["approval_kind"], "automatic");
+    assert_eq!(gamma_order["approval_reason"], "within_auto_approval_limit");
     assert_eq!(d(gamma_order["subtotal"].as_str().unwrap()), d("80.00"));
     let reasons: Vec<(String, String)> = observation["attention"]
         .as_array()
@@ -179,7 +178,7 @@ async fn below_par_items_become_costed_drafts_and_missing_details_are_surfaced()
         .await
         .unwrap();
     let again = check(&pool, w).await;
-    // Gamma's shortage is now covered by its approved order, so only the two drafts remain.
+    // Alpha and Beta stay as drafts; Gamma was approved by the agent and now covers its shortage.
     assert_eq!(again["orders"].as_array().unwrap().len(), 2, "{again}");
     assert!(
         again["orders"]
@@ -191,7 +190,7 @@ async fn below_par_items_become_costed_drafts_and_missing_details_are_surfaced()
     assert_eq!(again["covered_by_open_orders"], 1);
     let all = orders_in(&pool, w).await;
     assert_eq!(all.len(), 3, "no duplicate orders: {all:?}");
-    assert!(all.iter().all(|o| o["version"] == 1));
+    assert!(all.iter().filter(|o| o["status"] == "draft").all(|o| o["version"] == 1));
 
     // A stock change revises the existing draft in place.
     set_balance(&pool, w, "item-0", "5").await;
@@ -202,6 +201,17 @@ async fn below_par_items_become_costed_drafts_and_missing_details_are_surfaced()
     assert_eq!(d(alpha_revised["subtotal"].as_str().unwrap()), d("830.00"));
     let all = orders_in(&pool, w).await;
     assert_eq!(find(&all, "Alpha Foods")["version"], 2);
+
+    purchasing::decide(
+        &pool,
+        w,
+        gamma_order["id"].as_str().unwrap().parse().unwrap(),
+        "approve",
+        "tester",
+        None,
+    )
+    .await
+    .unwrap();
 
     // Once nothing is short for that vendor the draft is withdrawn, not left stale.
     set_balance(&pool, w, "item-0", "20").await;
@@ -648,6 +658,7 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
         &tables::TableQuery {
             page: Some(1),
             status: None,
+            search: None,
         },
     )
     .await
@@ -671,6 +682,7 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
         &tables::TableQuery {
             page: Some(2),
             status: None,
+            search: None,
         },
     )
     .await
@@ -695,6 +707,7 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
         &tables::TableQuery {
             page: Some(1),
             status: Some("draft".into()),
+            search: None,
         },
     )
     .await
@@ -707,6 +720,7 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
         &tables::TableQuery {
             page: Some(1),
             status: Some("open".into()),
+            search: None,
         },
     )
     .await
@@ -727,6 +741,7 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
         &tables::TableQuery {
             page: Some(2),
             status: Some("open".into()),
+            search: None,
         },
     )
     .await
@@ -739,7 +754,8 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
             "purchase-orders",
             &tables::TableQuery {
                 page: Some(1),
-                status: Some("paid".into())
+                status: Some("paid".into()),
+                search: None,
             }
         )
         .await
@@ -752,7 +768,8 @@ async fn purchase_order_pages_and_details_are_real_scoped_and_paginated() {
             "inventory",
             &tables::TableQuery {
                 page: Some(1),
-                status: Some("draft".into())
+                status: Some("draft".into()),
+                search: None,
             }
         )
         .await
